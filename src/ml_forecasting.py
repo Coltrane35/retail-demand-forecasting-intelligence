@@ -9,7 +9,14 @@ from src.metrics import mae, rmse, wape
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_PATH = ROOT / "data" / "processed" / "sales_ca1_foods.parquet"
+
+DATA_PATH = (
+    ROOT / "data" / "processed" / "sales_ca1_foods.parquet"
+)
+
+CALENDAR_PATH = (
+    ROOT / "data" / "processed" / "calendar_features.parquet"
+)
 
 HORIZON = 28
 LAGS = [28, 35, 42, 56]
@@ -27,9 +34,20 @@ FEATURES = [
     "day_of_month",
 ]
 
+CALENDAR_FEATURES = [
+    "has_event",
+    "is_sporting_event",
+    "is_national_event",
+    "is_religious_event",
+    "is_cultural_event",
+    "snap_CA",
+]
+
+FEATURES_WITH_CALENDAR = FEATURES + CALENDAR_FEATURES
+
 
 def create_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create features available at a 28-day forecast origin."""
+    """Create features safe for direct 28-day forecasting."""
     df = df.sort_values(["item_id", "date"]).copy()
 
     df["item_code"] = (
@@ -41,8 +59,8 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     for lag in LAGS:
         df[f"lag_{lag}"] = grouped.shift(lag)
 
-    # Shift by 28 days to avoid using sales
-    # from inside the forecast horizon.
+    # The earliest sales lag is 28 days.
+    # All features are available at forecast origin.
     df["rolling_mean_28"] = grouped.transform(
         lambda s: s.shift(28).rolling(28).mean()
     )
@@ -58,13 +76,38 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def run_lightgbm_experiment(top_n: int = 20) -> None:
+def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge calendar features using date."""
+    calendar = pd.read_parquet(CALENDAR_PATH)
+
+    result = df.merge(
+        calendar,
+        on="date",
+        how="left",
+        validate="many_to_one",
+    )
+
+    if result[CALENDAR_FEATURES].isna().any().any():
+        raise ValueError(
+            "Missing calendar features after merge."
+        )
+
+    return result
+
+
+def run_lightgbm_experiment(
+    top_n: int = 20,
+    use_calendar: bool = False,
+) -> None:
+    """Run a single 28-day LightGBM experiment."""
     print("Loading prepared sales data...")
+
     df = pd.read_parquet(DATA_PATH)
 
-    cutoff = df["date"].max() - pd.Timedelta(days=HORIZON)
+    cutoff = df["date"].max() - pd.Timedelta(
+        days=HORIZON
+    )
 
-    # Select products using training history only.
     top_items = (
         df.loc[df["date"] <= cutoff]
         .groupby("item_id")["sales"]
@@ -75,17 +118,24 @@ def run_lightgbm_experiment(top_n: int = 20) -> None:
 
     df = df[df["item_id"].isin(top_items)].copy()
 
-    print("Creating leakage-safe features...")
+    print("Creating historical features...")
     df = create_features(df)
 
+    feature_columns = FEATURES
+
+    if use_calendar:
+        print("Adding calendar features...")
+        df = add_calendar_features(df)
+        feature_columns = FEATURES_WITH_CALENDAR
+
+    valid_features = df[feature_columns].notna().all(axis=1)
+
     train = df[
-        (df["date"] <= cutoff)
-        & df[FEATURES].notna().all(axis=1)
+        (df["date"] <= cutoff) & valid_features
     ].copy()
 
     test = df[
-        (df["date"] > cutoff)
-        & df[FEATURES].notna().all(axis=1)
+        (df["date"] > cutoff) & valid_features
     ].copy()
 
     if len(test) != top_n * HORIZON:
@@ -108,24 +158,27 @@ def run_lightgbm_experiment(top_n: int = 20) -> None:
     )
 
     print("Training LightGBM...")
-    model.fit(train[FEATURES], train["sales"])
+    model.fit(train[feature_columns], train["sales"])
 
-    predictions = model.predict(test[FEATURES])
-    predictions = np.maximum(predictions, 0)
+    predictions = np.maximum(
+        model.predict(test[feature_columns]),
+        0,
+    )
 
     actual = test["sales"].to_numpy(dtype=float)
 
     print("\n=== LIGHTGBM RESULTS ===")
+    print(f"Calendar features: {use_calendar}")
     print(f"MAE:  {mae(actual, predictions):.4f}")
     print(f"RMSE: {rmse(actual, predictions):.4f}")
     print(f"WAPE: {wape(actual, predictions):.4%}")
 
-    print("\n=== FEATURE IMPORTANCE ===")
     importance = pd.Series(
         model.feature_importances_,
-        index=FEATURES,
+        index=feature_columns,
     ).sort_values(ascending=False)
 
+    print("\n=== FEATURE IMPORTANCE ===")
     print(importance)
 
     print("\nExperiment completed.")
