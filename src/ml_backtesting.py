@@ -1,19 +1,22 @@
 
 from pathlib import Path
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from src.forecasting import HORIZON
-from src.metrics import mae, rmse, wape
 from src.ml_forecasting import (
     DATA_PATH,
+    HORIZON,
     FEATURES,
     FEATURES_WITH_CALENDAR,
+    FEATURES_WITH_CALENDAR_AND_PRICE,
     create_features,
     add_calendar_features,
 )
+from src.price_features import add_price_features
+from src.metrics import mae, rmse, wape
+
+import lightgbm as lgb
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,18 +30,41 @@ def run_ml_backtest(
     top_n: int = TOP_N,
     n_folds: int = N_FOLDS,
     use_calendar: bool = True,
+    use_price: bool = True,
 ) -> pd.DataFrame:
 
+    if use_price and not use_calendar:
+        raise ValueError(
+            "Price experiment requires calendar features."
+        )
+
+    if use_price:
+        model_name = "lightgbm_calendar_price"
+        feature_columns = FEATURES_WITH_CALENDAR_AND_PRICE
+
+    elif use_calendar:
+        model_name = "lightgbm_calendar"
+        feature_columns = FEATURES_WITH_CALENDAR
+
+    else:
+        model_name = "lightgbm"
+        feature_columns = FEATURES
+
+    print(f"\nExperiment: {model_name}")
     print("Loading sales data...")
+
     df = pd.read_parquet(DATA_PATH)
+    df["date"] = pd.to_datetime(df["date"])
 
     max_date = df["date"].max()
 
-    first_cutoff = max_date - pd.Timedelta(
-        days=HORIZON * n_folds
+    first_cutoff = (
+        max_date
+        - pd.Timedelta(days=HORIZON * n_folds)
     )
 
-    # Select products before the first test window.
+    # Select products using only historical sales
+    # before the first test period.
     top_items = (
         df.loc[df["date"] <= first_cutoff]
         .groupby("item_id")["sales"]
@@ -47,23 +73,36 @@ def run_ml_backtest(
         .index
     )
 
-    df = df[df["item_id"].isin(top_items)].copy()
+    if len(top_items) != top_n:
+        raise ValueError(
+            "Not enough products for backtesting."
+        )
+
+    df = df[
+        df["item_id"].isin(top_items)
+    ].copy()
 
     print("Creating historical features...")
     df = create_features(df)
 
-    feature_columns = FEATURES
-
     if use_calendar:
         print("Adding calendar features...")
         df = add_calendar_features(df)
-        feature_columns = FEATURES_WITH_CALENDAR
 
-    valid_features = df[feature_columns].notna().all(axis=1)
+    if use_price:
+        print("Adding historical price features...")
+        df = add_price_features(df)
+
+    # Require complete sales features, but allow
+    # NaN in historical price features.
+    valid_features = (
+        df[FEATURES].notna().all(axis=1)
+    )
 
     results = []
 
     for fold in range(n_folds):
+
         test_start = (
             max_date
             - pd.Timedelta(
@@ -72,11 +111,15 @@ def run_ml_backtest(
             + pd.Timedelta(days=1)
         )
 
-        test_end = test_start + pd.Timedelta(
-            days=HORIZON - 1
+        test_end = (
+            test_start
+            + pd.Timedelta(days=HORIZON - 1)
         )
 
-        cutoff = test_start - pd.Timedelta(days=1)
+        cutoff = (
+            test_start
+            - pd.Timedelta(days=1)
+        )
 
         print(f"\n=== FOLD {fold + 1}/{n_folds} ===")
         print(f"Train cutoff: {cutoff.date()}")
@@ -86,7 +129,8 @@ def run_ml_backtest(
         )
 
         train = df[
-            (df["date"] <= cutoff) & valid_features
+            (df["date"] <= cutoff)
+            & valid_features
         ].copy()
 
         test = df[
@@ -95,10 +139,48 @@ def run_ml_backtest(
             & valid_features
         ].copy()
 
-        if len(test) != top_n * HORIZON:
+        expected_rows = top_n * HORIZON
+
+        if len(test) != expected_rows:
             raise ValueError(
-                f"Unexpected test size in fold {fold + 1}: "
-                f"{len(test)}"
+                f"Unexpected test size in fold "
+                f"{fold + 1}: {len(test)} "
+                f"(expected {expected_rows})"
+            )
+
+        if train.empty:
+            raise ValueError(
+                f"Empty training data in fold {fold + 1}"
+            )
+
+        # Calendar and sales features must be complete.
+        # Historical price features can contain NaN.
+        non_price_features = [
+            col for col in feature_columns
+            if not col.startswith("price_")
+        ]
+
+        if train[non_price_features].isna().any().any():
+            raise ValueError(
+                "Missing non-price training features."
+            )
+
+        if test[non_price_features].isna().any().any():
+            raise ValueError(
+                "Missing non-price test features."
+            )
+
+        print(f"Training rows: {len(train):,}")
+        print(f"Test rows: {len(test):,}")
+
+        if use_price:
+            missing_prices = (
+                test["price_lag_28"].isna().sum()
+            )
+
+            print(
+                "Missing historical prices in test:",
+                f"{missing_prices:,}",
             )
 
         model = lgb.LGBMRegressor(
@@ -111,8 +193,6 @@ def run_ml_backtest(
             verbosity=-1,
         )
 
-        print(f"Training rows: {len(train):,}")
-        print(f"Test rows: {len(test):,}")
         print("Training LightGBM...")
 
         model.fit(
@@ -125,7 +205,9 @@ def run_ml_backtest(
             0,
         )
 
-        actual = test["sales"].to_numpy(dtype=float)
+        actual = test["sales"].to_numpy(
+            dtype=float
+        )
 
         print(f"MAE:  {mae(actual, predictions):.4f}")
         print(f"RMSE: {rmse(actual, predictions):.4f}")
@@ -160,12 +242,7 @@ def run_ml_backtest(
         item_results["fold"] = fold + 1
         item_results["test_start"] = test_start
         item_results["test_end"] = test_end
-
-        item_results["model"] = (
-            "lightgbm_calendar"
-            if use_calendar
-            else "lightgbm"
-        )
+        item_results["model"] = model_name
 
         results.append(item_results)
 
@@ -196,18 +273,14 @@ def run_ml_backtest(
         exist_ok=True,
     )
 
-    suffix = (
-        "lightgbm_calendar"
-        if use_calendar
-        else "lightgbm"
-    )
-
     results_path = (
-        OUTPUT_DIR / f"{suffix}_results_rolling.csv"
+        OUTPUT_DIR
+        / f"{model_name}_results_rolling.csv"
     )
 
     summary_path = (
-        OUTPUT_DIR / f"{suffix}_summary_rolling.csv"
+        OUTPUT_DIR
+        / f"{model_name}_summary_rolling.csv"
     )
 
     results_df.to_csv(
@@ -252,7 +325,7 @@ def run_ml_backtest(
                 "global_rmse",
                 "global_wape",
             ]
-        ].round(4)
+        ].round(4).to_string()
     )
 
     summary.to_csv(summary_path)
@@ -265,4 +338,7 @@ def run_ml_backtest(
 
 
 if __name__ == "__main__":
-    run_ml_backtest(use_calendar=True)
+    run_ml_backtest(
+        use_calendar=True,
+        use_price=True,
+    )
